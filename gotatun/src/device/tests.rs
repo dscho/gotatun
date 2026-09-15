@@ -501,53 +501,56 @@ async fn reconfigure_while_suspended_stays_down() {
     drop((alice, bob));
 }
 
-/// [`Device::force_handshake`] performs a new handshake even when a session already exists.
+/// [`Device::wait_for_session`] performs a single handshake, and nothing once a session exists.
 #[tokio::test]
 #[test_log::test]
-async fn force_handshake() {
+async fn wait_for_session() {
     use crate::device::Error;
     use x25519_dalek::{PublicKey, StaticSecret};
 
-    let (alice, mut bob, eve) = mock::device_pair().await;
+    let (alice, _bob, eve) = mock::device_pair().await;
     let mut inits = std::pin::pin!(eve.wg_handshake_init());
+    let bob_public_key = get_first_and_only_peer(&alice).await.public_key;
 
-    // Establish a session through regular traffic.
-    let packet = mock::packet(b"Hello!");
-    alice.app_tx.send(packet.clone()).await;
-    let received = timeout(Duration::from_secs(1), bob.app_rx.recv())
-        .await
-        .expect("bob should receive alice's packet");
-    assert_eq!(received.as_bytes(), packet.as_bytes());
+    // Concurrent callers share a single handshake.
+    let (first, second) = timeout(Duration::from_secs(2), async {
+        join!(
+            alice.device.wait_for_session(&bob_public_key),
+            alice.device.wait_for_session(&bob_public_key),
+        )
+    })
+    .await
+    .expect("session should be established");
+    first.expect("first wait should succeed");
+    second.expect("second wait should succeed");
+
     timeout(Duration::from_secs(1), inits.next())
         .await
-        .expect("the initial handshake init should be observed");
+        .expect("a handshake init should be observed");
 
-    // Ensure the forced initiation is not rejected as a replay.
-    advance_mock_clock();
-
-    let bob_public_key = get_first_and_only_peer(&alice).await.public_key;
-    timeout(
-        Duration::from_secs(2),
-        alice.device.force_handshake(&bob_public_key),
-    )
-    .await
-    .expect("forced handshake should complete")
-    .expect("forced handshake should succeed");
-
-    let second_init = timeout(Duration::from_secs(1), inits.next())
+    // With a fresh session, no further handshake is initiated.
+    alice
+        .device
+        .wait_for_session(&bob_public_key)
         .await
-        .expect("a second handshake init should be observed");
-    assert!(second_init.is_some());
+        .expect("wait with a fresh session should succeed");
+
+    assert!(
+        timeout(Duration::from_millis(500), inits.next())
+            .await
+            .is_err(),
+        "no additional handshake init should be sent"
+    );
 
     let unknown_peer = PublicKey::from(&StaticSecret::random());
     assert!(matches!(
-        alice.device.force_handshake(&unknown_peer).await,
+        alice.device.wait_for_session(&unknown_peer).await,
         Err(Error::PeerNotFound)
     ));
 
     alice.device.suspend().await;
     assert!(matches!(
-        alice.device.force_handshake(&bob_public_key).await,
+        alice.device.wait_for_session(&bob_public_key).await,
         Err(Error::NotConnected)
     ));
 }

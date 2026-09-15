@@ -353,36 +353,39 @@ impl<T: DeviceTransports> Device<T> {
         Connection::set_up(self.inner.clone()).await
     }
 
-    /// Send a handshake initiation to the peer with `public_key`, and wait until a handshake
-    /// initiated by us completes.
+    /// Wait until there is a session with the peer with `public_key` that is not yet due for
+    /// rekeying.
     ///
-    /// The initiation is sent even if a session already exists or a handshake is in progress.
-    /// Lost initiations are retransmitted as usual, but this function never gives up on its own,
-    /// so wrap it in a timeout to bound the wait.
+    /// Returns immediately if such a session exists. Otherwise, a handshake initiation is sent
+    /// unless one is already in progress, and this waits until a handshake initiated by us
+    /// completes. Lost initiations are retransmitted as usual, but this function never gives up
+    /// on its own, so wrap it in a timeout to bound the wait.
     ///
     /// Returns [`Error::PeerNotFound`] if the peer does not exist or is removed while waiting.
-    pub async fn force_handshake(&self, public_key: &x25519::PublicKey) -> Result<(), Error> {
+    pub async fn wait_for_session(&self, public_key: &x25519::PublicKey) -> Result<(), Error> {
         let mut handshake_completed = {
             let device = self.inner.read().await;
             let connection = device.connection.as_ref().ok_or(Error::NotConnected)?;
             let peer_arc = device.peers.get(public_key).ok_or(Error::PeerNotFound)?;
 
             let mut peer = peer_arc.lock().await;
+            if peer.tunnel.has_fresh_session() {
+                return Ok(());
+            }
             let endpoint_addr = peer.endpoint().addr.ok_or(Error::NoEndpoint)?;
 
             // Subscribe before sending so that a fast response cannot be missed
             let handshake_completed = peer.subscribe_handshake_completed();
 
-            let packet = WgKind::from(
-                peer.tunnel
-                    .format_handshake_initiation(true)
-                    .expect("a forced handshake initiation is always created"),
-            );
-            DeviceState::<T>::register_handshake_idx(&device.peers_by_idx, &packet, peer_arc);
-            drop(peer);
+            // `None` means that our own initiation is already in flight
+            if let Some(packet) = peer.tunnel.format_handshake_initiation(false) {
+                let packet = WgKind::from(packet);
+                DeviceState::<T>::register_handshake_idx(&device.peers_by_idx, &packet, peer_arc);
+                drop(peer);
 
-            // NOTE: Like `handle_timers`, this does not trigger DAITA events.
-            connection.udp.send_to(packet.into(), endpoint_addr).await?;
+                // NOTE: Like `handle_timers`, this does not trigger DAITA events.
+                connection.udp.send_to(packet.into(), endpoint_addr).await?;
+            }
 
             handshake_completed
         };
