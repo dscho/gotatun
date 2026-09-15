@@ -14,6 +14,8 @@ use ipnetwork::IpNetwork;
 
 use std::net::SocketAddr;
 
+use tokio::sync::watch;
+
 use crate::device::AllowedIps;
 #[cfg(feature = "daita")]
 use crate::device::daita::{DaitaHooks, DaitaSettings};
@@ -42,6 +44,9 @@ pub struct PeerState {
     daita_settings: Option<DaitaSettings>,
     #[cfg(feature = "daita")]
     pub(crate) daita: Option<DaitaHooks>,
+
+    /// Notified whenever a handshake that we initiated completes.
+    handshake_completed: watch::Sender<()>,
 }
 
 impl PeerState {
@@ -59,7 +64,20 @@ impl PeerState {
             daita_settings,
             #[cfg(feature = "daita")]
             daita: None,
+            handshake_completed: watch::Sender::new(()),
         }
+    }
+
+    /// Subscribe to completions of handshakes that we initiated.
+    ///
+    /// The receiver only sees completions that happen after this call.
+    pub fn subscribe_handshake_completed(&self) -> watch::Receiver<()> {
+        self.handshake_completed.subscribe()
+    }
+
+    /// Wake everyone waiting on [`Self::subscribe_handshake_completed`].
+    pub fn notify_handshake_completed(&self) {
+        self.handshake_completed.send_replace(());
     }
 
     #[cfg(feature = "daita")]

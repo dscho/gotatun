@@ -501,6 +501,57 @@ async fn reconfigure_while_suspended_stays_down() {
     drop((alice, bob));
 }
 
+/// [`Device::force_handshake`] performs a new handshake even when a session already exists.
+#[tokio::test]
+#[test_log::test]
+async fn force_handshake() {
+    use crate::device::Error;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let (alice, mut bob, eve) = mock::device_pair().await;
+    let mut inits = std::pin::pin!(eve.wg_handshake_init());
+
+    // Establish a session through regular traffic.
+    let packet = mock::packet(b"Hello!");
+    alice.app_tx.send(packet.clone()).await;
+    let received = timeout(Duration::from_secs(1), bob.app_rx.recv())
+        .await
+        .expect("bob should receive alice's packet");
+    assert_eq!(received.as_bytes(), packet.as_bytes());
+    timeout(Duration::from_secs(1), inits.next())
+        .await
+        .expect("the initial handshake init should be observed");
+
+    // Ensure the forced initiation is not rejected as a replay.
+    advance_mock_clock();
+
+    let bob_public_key = get_first_and_only_peer(&alice).await.public_key;
+    timeout(
+        Duration::from_secs(2),
+        alice.device.force_handshake(&bob_public_key),
+    )
+    .await
+    .expect("forced handshake should complete")
+    .expect("forced handshake should succeed");
+
+    let second_init = timeout(Duration::from_secs(1), inits.next())
+        .await
+        .expect("a second handshake init should be observed");
+    assert!(second_init.is_some());
+
+    let unknown_peer = PublicKey::from(&StaticSecret::random());
+    assert!(matches!(
+        alice.device.force_handshake(&unknown_peer).await,
+        Err(Error::PeerNotFound)
+    ));
+
+    alice.device.suspend().await;
+    assert!(matches!(
+        alice.device.force_handshake(&bob_public_key).await,
+        Err(Error::NotConnected)
+    ));
+}
+
 /// Helper method to test that packets can be sent from one [`Device`] to another.
 /// Use `eavesdrop` to sniff wireguard packets and assert things about the connection.
 async fn test_device_pair(eavesdrop: impl AsyncFnOnce(MockEavesdropper) + Send) {

@@ -89,6 +89,18 @@ pub enum Error {
     #[error("Failed to initialize DAITA hooks")]
     #[cfg(feature = "daita")]
     DaitaHooks(#[from] daita::Error),
+
+    /// No peer with the given public key exists
+    #[error("No peer with the given public key exists")]
+    PeerNotFound,
+
+    /// The peer has no known endpoint
+    #[error("The peer has no known endpoint")]
+    NoEndpoint,
+
+    /// The device has no active connection, e.g. because it is suspended
+    #[error("The device has no active connection")]
+    NotConnected,
 }
 
 /// A reference-counted handle to a WireGuard device.
@@ -339,6 +351,47 @@ impl<T: DeviceTransports> Device<T> {
         }
 
         Connection::set_up(self.inner.clone()).await
+    }
+
+    /// Send a handshake initiation to the peer with `public_key`, and wait until a handshake
+    /// initiated by us completes.
+    ///
+    /// The initiation is sent even if a session already exists or a handshake is in progress.
+    /// Lost initiations are retransmitted as usual, but this function never gives up on its own,
+    /// so wrap it in a timeout to bound the wait.
+    ///
+    /// Returns [`Error::PeerNotFound`] if the peer does not exist or is removed while waiting.
+    pub async fn force_handshake(&self, public_key: &x25519::PublicKey) -> Result<(), Error> {
+        let mut handshake_completed = {
+            let device = self.inner.read().await;
+            let connection = device.connection.as_ref().ok_or(Error::NotConnected)?;
+            let peer_arc = device.peers.get(public_key).ok_or(Error::PeerNotFound)?;
+
+            let mut peer = peer_arc.lock().await;
+            let endpoint_addr = peer.endpoint().addr.ok_or(Error::NoEndpoint)?;
+
+            // Subscribe before sending so that a fast response cannot be missed
+            let handshake_completed = peer.subscribe_handshake_completed();
+
+            let packet = WgKind::from(
+                peer.tunnel
+                    .format_handshake_initiation(true)
+                    .expect("a forced handshake initiation is always created"),
+            );
+            DeviceState::<T>::register_handshake_idx(&device.peers_by_idx, &packet, peer_arc);
+            drop(peer);
+
+            // NOTE: Like `handle_timers`, this does not trigger DAITA events.
+            connection.udp.send_to(packet.into(), endpoint_addr).await?;
+
+            handshake_completed
+        };
+
+        // The sender is dropped along with the peer
+        handshake_completed
+            .changed()
+            .await
+            .map_err(|_| Error::PeerNotFound)
     }
 
     /// Wait until an unrecoverable error occurs.
@@ -672,6 +725,8 @@ impl<T: DeviceTransports> DeviceState<T> {
             #[cfg(not(feature = "daita"))]
             let PeerState { tunnel, .. } = &mut *peer;
 
+            let is_handshake_resp = matches!(parsed_packet, WgKind::HandshakeResp(_));
+
             match tunnel.handle_incoming_packet(parsed_packet) {
                 TunnResult::Done => {
                     // Don't update the peer endpoint on cookie replies, for consistency
@@ -702,6 +757,10 @@ impl<T: DeviceTransports> DeviceState<T> {
 
                     // Update the peer endpoint if we received any authenticated packet
                     peer.set_endpoint(addr);
+
+                    if is_handshake_resp {
+                        peer.notify_handshake_completed();
+                    }
                 }
                 #[cfg_attr(not(feature = "daita"), expect(unused_mut))]
                 TunnResult::WriteToTunnel(mut packet) => {
