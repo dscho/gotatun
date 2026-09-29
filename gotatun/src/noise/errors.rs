@@ -25,6 +25,8 @@ pub enum WireGuardError {
     WrongIndex,
     /// The cryptographic key used is incorrect or invalid.
     WrongKey,
+    /// A Diffie-Hellman exchange yielded a non-contributory shared secret.
+    InvalidSharedSecret,
     /// The TAI64N timestamp format is invalid.
     InvalidTai64nTimestamp,
     /// The TAI64N timestamp is incorrect (e.g., replayed or out of order).

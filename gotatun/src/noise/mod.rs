@@ -413,7 +413,13 @@ impl<R: RngCore + Send> Tunn<R> {
 
         let starting_new_handshake = !self.handshake.is_in_progress();
 
-        let packet = self.handshake.format_handshake_initiation();
+        let packet = match self.handshake.format_handshake_initiation() {
+            Ok(packet) => packet,
+            Err(error) => {
+                tracing::warn!("Not sending handshake_initiation: {error:?}");
+                return None;
+            }
+        };
         tracing::debug!("Sending handshake_initiation");
 
         if starting_new_handshake {
@@ -660,6 +666,45 @@ mod tests {
     fn handshake_init() {
         let (mut my_tun, _their_tun) = create_two_tuns();
         let _init = create_handshake_init(&mut my_tun);
+    }
+
+    #[test]
+    fn low_order_peer_static_key_aborts_initiation() {
+        for low_order in crate::noise::handshake::low_order_keys() {
+            let private = x25519::StaticSecret::random_from_rng(rand_core::OsRng);
+            let public = x25519::PublicKey::from(&private);
+            let rate_limiter = Arc::new(RateLimiter::new(&public, HANDSHAKE_RATE_LIMIT));
+            let mut tun = Tunn::new(
+                private,
+                x25519::PublicKey::from(low_order),
+                None,
+                None,
+                IndexTable::from_os_rng(),
+                rate_limiter,
+            );
+
+            assert!(
+                tun.format_handshake_initiation(false).is_none(),
+                "point {low_order:02x?}: non-contributory peer must not receive an initiation"
+            );
+        }
+    }
+
+    #[test]
+    fn low_order_responder_ephemeral_aborts_handshake() {
+        let (mut tun, _) = create_two_tuns();
+        let init = create_handshake_init(&mut tun);
+
+        for low_order in crate::noise::handshake::low_order_keys() {
+            let response = WgHandshakeResp::new(42, init.sender_idx.get(), low_order);
+            assert!(
+                matches!(
+                    tun.handshake.receive_handshake_response(&response),
+                    Err(WireGuardError::InvalidSharedSecret)
+                ),
+                "point {low_order:02x?}: non-contributory response must be rejected"
+            );
+        }
     }
 
     #[test]
