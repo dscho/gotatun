@@ -10,7 +10,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use clap::Parser;
-use eyre::{Context, Result};
+use eyre::{Context, Result, bail};
 use gotatun::device::uapi::UapiServer;
 use gotatun::device::{DefaultDeviceTransports, Device, DeviceBuilder};
 use gotatun::tun::tun_async_device::TunDevice;
@@ -34,10 +34,9 @@ struct Args {
     #[clap(short, long, env = "WG_LOG_FILE")]
     log: Option<PathBuf>,
 
-    /// Path to wintun.dll. If omitted, wintun.dll is searched using the default DLL search order
-    /// (which includes the executable directory and PATH).
+    /// Absolute path to a trusted wintun.dll in a protected directory
     #[clap(long, env = "WINTUN_PATH")]
-    wintun: Option<PathBuf>,
+    wintun: PathBuf,
 }
 
 pub fn main() {
@@ -92,15 +91,11 @@ fn setup_logging(args: &Args) -> Result<Option<tracing_appender::non_blocking::W
 
 /// Create and configure the WireGuard tunnel device.
 async fn setup_device(args: &Args) -> eyre::Result<Device<DefaultDeviceTransports>> {
-    let tun = match &args.wintun {
-        Some(wintun_path) => {
-            TunDevice::from_name_with_wintun_path(&args.interface_name, wintun_path)
-                .context("Failed to create TUN device")?
-        }
-        None => {
-            TunDevice::from_name(&args.interface_name).context("Failed to create TUN device")?
-        }
-    };
+    if !args.wintun.is_absolute() {
+        bail!("--wintun must be an absolute path to a trusted wintun.dll");
+    }
+    let tun = TunDevice::from_name_with_wintun_path(&args.interface_name, &args.wintun)
+        .context("Failed to create TUN device")?;
 
     let tun_name = tun.name().context("Failed to get TUN device name")?;
     info!("Tunnel interface: {tun_name}");
