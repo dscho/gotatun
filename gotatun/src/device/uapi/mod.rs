@@ -146,30 +146,18 @@ impl UapiServer {
     /// Spawn a unix socket at `/var/run/wireguard/<name>.sock`. This socket speaks the official
     /// [configuration protocol](https://www.wireguard.com/xplatform/#configuration-protocol).
     ///
-    /// Optionally, set the owner of the socket using `uid` and `gid`.
+    /// The socket is owner-only (0600), regardless of the process umask.
+    /// Optionally, set its owner using `uid` and `gid`.
     #[cfg(unix)]
     pub fn default_unix_socket(
         name: &str,
         uid: Option<Uid>,
         gid: Option<Gid>,
     ) -> eyre::Result<Self> {
-        use tokio::net::UnixListener;
-
         let path = format!("{SOCK_DIR}/{name}.sock");
 
-        create_sock_dir()?;
-
-        let _ = std::fs::remove_file(&path); // Attempt to remove the socket if already exists
-
-        // Bind a new socket to the path
-        let api_listener =
-            UnixListener::bind(&path).map_err(|e| eyre!("Failed to bind unix socket: {e}"))?;
-
-        if (uid.is_some() || gid.is_some())
-            && let Err(err) = nix::unistd::chown(std::path::Path::new(&path), uid, gid)
-        {
-            tracing::warn!("Failed to change owner of UDS: {err}");
-        }
+        create_sock_dir(std::path::Path::new(SOCK_DIR))?;
+        let api_listener = bind_private_unix_socket(std::path::Path::new(&path), uid, gid)?;
 
         let (tx, rx) = UapiServer::new();
 
@@ -395,19 +383,79 @@ impl Debug for UapiServer {
 }
 
 #[cfg(unix)]
-fn create_sock_dir() -> eyre::Result<()> {
-    match std::fs::create_dir(SOCK_DIR) {
+fn create_sock_dir(path: &std::path::Path) -> eyre::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    match std::fs::DirBuilder::new().mode(0o755).create(path) {
         Ok(_) => {
-            tracing::info!("Created socket directory at {SOCK_DIR}");
+            tracing::info!("Created socket directory at {}", path.display());
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Directory already exists, which is fine
+            // Check its permissions below.
         }
         Err(e) => {
-            bail!("Failed to create socket directory {SOCK_DIR}: {e}");
+            bail!("Failed to create socket directory {}: {e}", path.display());
         }
     }
+
+    let metadata = std::fs::metadata(path)
+        .wrap_err_with(|| format!("Failed to inspect socket directory {}", path.display()))?;
+    if !metadata.is_dir()
+        || metadata.permissions().mode() & 0o022 != 0
+        || ![0, nix::unistd::geteuid().as_raw()].contains(&metadata.uid())
+    {
+        bail!(
+            "Socket directory {} must be owned by root or this user and not writable by others",
+            path.display()
+        );
+    }
+
     Ok(())
+}
+
+#[cfg(unix)]
+fn bind_private_unix_socket(
+    path: &std::path::Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+) -> eyre::Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| eyre!("UAPI socket path has no parent"))?;
+    // Bind privately, then publish the restricted socket without a connectable chmod window.
+    let staging_dir = parent.join(format!(".gotatun-{:032x}", rand::random::<u128>()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&staging_dir)
+        .wrap_err("Failed to create private UAPI socket directory")?;
+    let staged = staging_dir.join("socket");
+
+    let listener = (|| {
+        let listener = tokio::net::UnixListener::bind(&staged)
+            .wrap_err("Failed to bind private UAPI socket")?;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))
+            .wrap_err("Failed to restrict UAPI socket permissions")?;
+        if uid.is_some() || gid.is_some() {
+            nix::unistd::chown(&staged, uid, gid).wrap_err("Failed to set UAPI socket owner")?;
+        }
+        std::fs::rename(&staged, path).wrap_err("Failed to publish UAPI socket")?;
+        Ok(listener)
+    })();
+
+    if listener.is_err() {
+        match std::fs::remove_file(&staged) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!("Failed to remove staged UAPI socket: {error}"),
+        }
+    }
+    if let Err(error) = std::fs::remove_dir(&staging_dir) {
+        tracing::warn!("Failed to remove private UAPI socket directory: {error}");
+    }
+
+    listener
 }
 
 impl<T: DeviceTransports> DeviceState<T> {
@@ -736,6 +784,40 @@ mod tests {
         };
 
         assert_eq!(validate_set(&set), Err(EINVAL));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_is_owner_only_and_listening() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        // Leave room for the staging directory within the Unix socket path limit.
+        let directory = std::path::Path::new("/tmp")
+            .join(format!("gotatun-uapi-{:016x}", rand::random::<u64>()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let socket_dir = directory.join("wireguard");
+        super::create_sock_dir(&socket_dir).unwrap();
+        let dir_mode = std::fs::metadata(&socket_dir).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o022, 0);
+
+        let path = socket_dir.join("wg0.sock");
+        let listener = super::bind_private_unix_socket(&path, None, None).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        drop((stream, accepted, listener));
+
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(super::create_sock_dir(&socket_dir).is_err());
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(socket_dir).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 }
 
