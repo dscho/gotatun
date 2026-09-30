@@ -8,12 +8,20 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
 eyre = { workspace = true }
 gotatun = { workspace = true, features = ["aws-lc-rs", "device"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 ipnetwork = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
 smoltcp = { version = "=0.14.0", default-features = false, features = [
     "std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-tcp-reno", "async",
 ] }
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

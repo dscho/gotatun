@@ -6,6 +6,9 @@
 
 //! TCP sockets carried by GotaTun and smoltcp entirely in userspace.
 
+/// HTTP forwarding and WebSocket tunneling over the userspace TCP stack.
+pub mod http;
+
 use std::collections::{HashSet, VecDeque};
 use std::future::poll_fn;
 use std::io;
@@ -464,9 +467,10 @@ impl Drop for TcpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eyre::bail;
     use gotatun::device::uapi::UapiServer;
     use gotatun::device::uapi::command::{Get, Response};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
     fn listen(stack: &TcpStack, port: u16) -> Result<SocketHandle> {
         let mut core = stack.core.lock();
@@ -517,8 +521,84 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn tcp_over_wireguard_survives_resume_and_multiple_streams() -> Result<()> {
+    async fn server_read(stack: &TcpStack, handle: SocketHandle) -> Result<Vec<u8>> {
+        loop {
+            let result = {
+                let mut core = stack.core.lock();
+                let socket = core.sockets.get_mut::<tcp::Socket>(handle);
+                if socket.can_recv() {
+                    let mut data = [0; 1024];
+                    let len = socket.recv_slice(&mut data)?;
+                    Some(data[..len].to_vec())
+                } else if !socket.is_active() && socket.state() != tcp::State::Listen {
+                    bail!("Virtual TCP peer closed before sending data");
+                } else {
+                    None
+                }
+            };
+            if let Some(data) = result {
+                stack.wake.notify_one();
+                return Ok(data);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    async fn server_read_headers(stack: &TcpStack, handle: SocketHandle) -> Result<String> {
+        let mut data = Vec::new();
+        while !data.ends_with(b"\r\n\r\n") {
+            data.extend_from_slice(&server_read(stack, handle).await?);
+            if data.len() > 8192 {
+                bail!("HTTP request headers too large");
+            }
+        }
+        Ok(String::from_utf8(data)?)
+    }
+
+    async fn server_write(stack: &TcpStack, handle: SocketHandle, data: &[u8]) -> Result<()> {
+        let mut sent = 0;
+        while sent < data.len() {
+            let count = {
+                let mut core = stack.core.lock();
+                let socket = core.sockets.get_mut::<tcp::Socket>(handle);
+                if socket.can_send() {
+                    socket.send_slice(&data[sent..])?
+                } else if !socket.may_send() {
+                    bail!("Virtual TCP peer closed before receiving data");
+                } else {
+                    0
+                }
+            };
+            if count == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            } else {
+                sent += count;
+                stack.wake.notify_one();
+            }
+        }
+        Ok(())
+    }
+
+    async fn read_response_headers(
+        reader: &mut BufReader<tokio::net::TcpStream>,
+    ) -> Result<String> {
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).await? == 0 {
+                bail!("HTTP proxy closed before sending response headers");
+            }
+            headers.push_str(&line);
+            if headers.len() > 8192 {
+                bail!("HTTP response headers too large");
+            }
+            if line == "\r\n" {
+                return Ok(headers);
+            }
+        }
+    }
+
+    async fn peers() -> Result<(TcpStack, Tunnel, WgDevice)> {
         let hub_address = Ipv4Addr::new(10, 10, 0, 1);
         let client_address = Ipv4Addr::new(10, 10, 0, 5);
         let client_key = rand::random::<[u8; 32]>();
@@ -549,11 +629,6 @@ mod tests {
             .filter(|port| *port != 0)
             .ok_or_else(|| eyre!("hub UDP port not assigned"))?;
 
-        let first = listen(&server_stack, 8080)?;
-        let after_resume = listen(&server_stack, 8081)?;
-        let concurrent_a = listen(&server_stack, 8082)?;
-        let concurrent_b = listen(&server_stack, 8083)?;
-
         let client = Tunnel::connect(
             client_address,
             client_key,
@@ -562,6 +637,17 @@ mod tests {
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
         )
         .await?;
+        Ok((server_stack, client, server))
+    }
+
+    #[tokio::test]
+    async fn tcp_over_wireguard_survives_resume_and_multiple_streams() -> Result<()> {
+        let (server_stack, client, server) = peers().await?;
+        let hub_address = Ipv4Addr::new(10, 10, 0, 1);
+        let first = listen(&server_stack, 8080)?;
+        let after_resume = listen(&server_stack, 8081)?;
+        let concurrent_a = listen(&server_stack, 8082)?;
+        let concurrent_b = listen(&server_stack, 8083)?;
         let tcp = client.tcp();
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -589,6 +675,183 @@ mod tests {
                 echo(&server_stack, concurrent_a, b"red"),
                 echo(&server_stack, concurrent_b, b"blue"),
             )
+        })
+        .await??;
+        server.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_websocket_and_connect_cross_wireguard() -> Result<()> {
+        let (server_stack, client, server) = peers().await?;
+        let plain = listen(&server_stack, 8090)?;
+        let websocket = listen(&server_stack, 8091)?;
+        let secure_websocket = listen(&server_stack, 8092)?;
+        let upload = listen(&server_stack, 8093)?;
+
+        let proxy_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let proxy_address = proxy_listener.local_addr()?;
+        let _proxy = tokio::spawn(http::serve(proxy_listener, client.tcp()));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::try_join!(
+                async {
+                    let headers = server_read_headers(&server_stack, plain).await?;
+                    assert!(headers.starts_with("GET /path HTTP/1.1\r\n"), "{headers}");
+                    let headers = headers.to_ascii_lowercase();
+                    assert!(!headers.contains("proxy-authorization:"), "{headers}");
+                    assert!(!headers.contains("proxy-connection:"), "{headers}");
+                    server_write(
+                        &server_stack,
+                        plain,
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                    )
+                    .await
+                },
+                async {
+                    let mut socket = tokio::net::TcpStream::connect(proxy_address).await?;
+                    socket
+                        .write_all(
+                            b"GET http://10.10.0.1:8090/path HTTP/1.1\r\n\
+                              Host: 10.10.0.1:8090\r\nProxy-Authorization: Basic dGVzdA==\r\n\
+                              Proxy-Connection: keep-alive\r\nConnection: close\r\n\r\n",
+                        )
+                        .await?;
+                    let mut response = Vec::new();
+                    socket.read_to_end(&mut response).await?;
+                    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"), "{response:?}");
+                    assert!(response.ends_with(b"\r\n\r\nhello"), "{response:?}");
+                    Ok::<_, eyre::Report>(())
+                }
+            )
+        })
+        .await??;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::try_join!(
+                async {
+                    let mut request = Vec::new();
+                    let body_start = loop {
+                        request.extend_from_slice(&server_read(&server_stack, upload).await?);
+                        if request.len() > 8192 {
+                            bail!("HTTP upload request too large");
+                        }
+                        if let Some(offset) =
+                            request.windows(4).position(|part| part == b"\r\n\r\n")
+                            && request.len() >= offset + 4 + 11
+                        {
+                            break offset + 4;
+                        }
+                    };
+                    let headers = String::from_utf8(request[..body_start].to_vec())?;
+                    assert!(
+                        headers.starts_with("POST /upload HTTP/1.1\r\n"),
+                        "{headers}"
+                    );
+                    assert_eq!(&request[body_start..], b"hello world");
+                    server_write(
+                        &server_stack,
+                        upload,
+                        b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                },
+                async {
+                    let mut socket = tokio::net::TcpStream::connect(proxy_address).await?;
+                    socket
+                        .write_all(
+                            b"POST http://10.10.0.1:8093/upload HTTP/1.1\r\n\
+                              Host: 10.10.0.1:8093\r\nContent-Length: 11\r\n\
+                              Connection: close\r\n\r\nhello world",
+                        )
+                        .await?;
+                    let mut response = Vec::new();
+                    socket.read_to_end(&mut response).await?;
+                    assert!(
+                        response.starts_with(b"HTTP/1.1 201 Created\r\n"),
+                        "{response:?}"
+                    );
+                    assert!(response.ends_with(b"\r\n\r\nok"), "{response:?}");
+                    Ok::<_, eyre::Report>(())
+                }
+            )
+        })
+        .await??;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::try_join!(
+                async {
+                    let headers = server_read_headers(&server_stack, websocket).await?;
+                    assert!(headers.starts_with("GET /ws HTTP/1.1\r\n"), "{headers}");
+                    server_write(
+                        &server_stack,
+                        websocket,
+                        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\
+                          Upgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                    )
+                    .await?;
+                    let mut frame = Vec::new();
+                    while frame.len() < 8 {
+                        frame.extend_from_slice(&server_read(&server_stack, websocket).await?);
+                    }
+                    assert_eq!(&frame, &[0x81, 0x82, 0, 0, 0, 0, b'h', b'i']);
+                    server_write(&server_stack, websocket, &[0x81, 2, b'h', b'i']).await
+                },
+                async {
+                    let socket = tokio::net::TcpStream::connect(proxy_address).await?;
+                    let mut client = BufReader::new(socket);
+                    client
+                        .get_mut()
+                        .write_all(
+                            b"GET ws://10.10.0.1:8091/ws HTTP/1.1\r\n\
+                              Host: 10.10.0.1:8091\r\nConnection: Upgrade\r\n\
+                              Upgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                              Sec-WebSocket-Version: 13\r\n\r\n",
+                        )
+                        .await?;
+                    let headers = read_response_headers(&mut client).await?;
+                    assert!(headers.starts_with("HTTP/1.1 101 "), "{headers}");
+                    client
+                        .get_mut()
+                        .write_all(&[0x81, 0x82, 0, 0, 0, 0, b'h', b'i'])
+                        .await?;
+                    let mut echoed = [0; 4];
+                    client.read_exact(&mut echoed).await?;
+                    assert_eq!(&echoed, &[0x81, 2, b'h', b'i']);
+                    Ok::<_, eyre::Report>(())
+                }
+            )
+        })
+        .await??;
+
+        let mut invalid = tokio::net::TcpStream::connect(proxy_address).await?;
+        invalid
+            .write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut rejected = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), invalid.read_to_end(&mut rejected)).await??;
+        assert!(
+            rejected.starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+            "{rejected:?}"
+        );
+
+        let opaque = b"\x16\x03\x03tls\x00opaque";
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::try_join!(echo(&server_stack, secure_websocket, opaque), async {
+                let socket = tokio::net::TcpStream::connect(proxy_address).await?;
+                let mut client = BufReader::new(socket);
+                client
+                    .get_mut()
+                    .write_all(b"CONNECT 10.10.0.1:8092 HTTP/1.1\r\nHost: 10.10.0.1:8092\r\n\r\n")
+                    .await?;
+                let headers = read_response_headers(&mut client).await?;
+                assert!(headers.starts_with("HTTP/1.1 200 "), "{headers}");
+                client.get_mut().write_all(opaque).await?;
+                let mut echoed = vec![0; opaque.len()];
+                client.read_exact(&mut echoed).await?;
+                assert_eq!(&echoed, opaque);
+                Ok::<_, eyre::Report>(())
+            })
         })
         .await??;
         server.stop().await;

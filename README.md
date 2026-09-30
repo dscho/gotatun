@@ -81,6 +81,38 @@ The Windows CLI requires `--wintun` (or `WINTUN_PATH`) to specify an absolute
 path to a trusted `wintun.dll` in a directory protected from unprivileged
 writes. It does not search for the DLL by name.
 
+## Userspace HTTP proxy (WSL 1)
+
+`gotatun-proxy` connects to a WireGuard hub without a Linux TUN device or
+Windows VPN installation. It listens on `127.0.0.1:18080` by default, accepts
+HTTP forward requests, forwards `ws://` upgrades, and uses CONNECT for HTTPS
+and `wss://`. Applications must explicitly use it as their HTTP proxy;
+ordinary IP traffic from WSL does not use the tunnel. Only numeric IPv4
+destinations are supported.
+
+Give it a private WireGuard peer configuration (`chmod 600 peer.conf`):
+
+```ini
+[Interface]
+PrivateKey = <PEER_PRIVATE_KEY>
+Address = 10.10.0.5/24
+
+[Peer]
+PublicKey = <HUB_PUBLIC_KEY>
+PresharedKey = <PEER_PRESHARED_KEY>
+Endpoint = <HUB_PUBLIC_IPV4>:52897
+AllowedIPs = 10.10.0.0/24
+PersistentKeepalive = 25
+```
+
+Run `cargo run --release -p gotatun-proxy -- peer.conf` on Linux/ARM64, or
+use the built binary. For example, set `http_proxy` and `https_proxy` to
+`http://127.0.0.1:18080` in applications that should reach the other peers.
+WSL 1 [shares the Windows host's networking][wsl-networking], so Windows
+programs can use that localhost proxy too.
+
+[wsl-networking]: https://learn.microsoft.com/en-us/windows/wsl/networking
+
 ## UAPI extensions
 
 See [UAPI](./UAPI.md) for extensions to the `wg` configuration protocol.
