@@ -77,24 +77,25 @@ The behaviour is similar to that of [wireguard-go](https://git.zx2c4.com/wiregua
 
 ### Windows
 
-The Windows CLI requires `--wintun` (or `WINTUN_PATH`) to specify an absolute
-path to a trusted `wintun.dll` in a directory protected from unprivileged
-writes. It does not search for the DLL by name.
+The TUN-based Windows CLI requires `--wintun` (or `WINTUN_PATH`) to specify
+an absolute path to a trusted `wintun.dll` in a directory protected from
+unprivileged writes. It does not search for the DLL by name.
 
-## Userspace HTTP proxy (WSL 1)
+## Userspace HTTP proxy (Windows on Arm64 and Linux)
 
-`gotatun-proxy` connects to a WireGuard hub without a Linux TUN device or
-Windows VPN installation. It listens on `127.0.0.1:18080` by default, accepts
-HTTP forward requests, forwards `ws://` upgrades, and uses CONNECT for HTTPS
-and `wss://`. Applications must explicitly use it as their HTTP proxy;
-ordinary IP traffic from WSL does not use the tunnel. Only numeric IPv4
-destinations are supported.
+`gotatun-proxy` uses GotaTun and smoltcp entirely in userspace: no TUN device,
+Wintun, or WireGuard for Windows installation is needed. A matching `.5` peer
+must be configured on the hub. The native Windows/Arm64 runtime has not yet
+been tested on the DevBox.
 
-Give it a private WireGuard peer configuration (`chmod 600 peer.conf`):
+Keep the private `peer.conf` outside the OneDrive-synced source worktree;
+do not commit or sync it. On Windows, store it under
+`%LOCALAPPDATA%\GotatunProxy\peer.conf` with access restricted to your user.
+Replace the placeholders locally:
 
 ```ini
 [Interface]
-PrivateKey = <PEER_PRIVATE_KEY>
+PrivateKey = <CLIENT_PRIVATE_KEY>
 Address = 10.10.0.5/24
 
 [Peer]
@@ -105,13 +106,23 @@ AllowedIPs = 10.10.0.0/24
 PersistentKeepalive = 25
 ```
 
-Run `cargo run --release -p gotatun-proxy -- peer.conf` on Linux/ARM64, or
-use the built binary. For example, set `http_proxy` and `https_proxy` to
-`http://127.0.0.1:18080` in applications that should reach the other peers.
-WSL 1 [shares the Windows host's networking][wsl-networking], so Windows
-programs can use that localhost proxy too.
+From the source worktree in Visual Studio Developer PowerShell on Windows/Arm64:
 
-[wsl-networking]: https://learn.microsoft.com/en-us/windows/wsl/networking
+```powershell
+$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA 'gotatun-target'
+cargo.exe build --release --locked -p gotatun-proxy --target aarch64-pc-windows-msvc
+$config = Join-Path $env:LOCALAPPDATA 'GotatunProxy\peer.conf'
+$exe = Join-Path $env:CARGO_TARGET_DIR 'aarch64-pc-windows-msvc\release\gotatun-proxy.exe'
+& $exe $config
+```
+
+Set each application's HTTP/HTTPS proxy to `http://127.0.0.1:18080` (or
+choose another local port with `--port`). Ordinary HTTP and `ws://` upgrades
+are forwarded; HTTPS and `wss://` use CONNECT. Destinations must be numeric
+IPv4 addresses, and traffic not sent through the proxy remains unaffected.
+
+On Linux, keep the config outside the worktree, run `chmod 600 peer.conf`,
+then `cargo run --release -p gotatun-proxy -- peer.conf`.
 
 ## UAPI extensions
 
