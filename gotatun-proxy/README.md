@@ -133,8 +133,11 @@ under that triple's `release` subdirectory.
 
 The proxy listens on `127.0.0.1:18080` by default; use `--port` to choose
 another localhost port. Set the application's HTTP/HTTPS proxy to
-`http://127.0.0.1:18080`. To verify it, request an existing HTTP service
-at a numeric IPv4 address on the WireGuard network:
+`http://127.0.0.1:18080`. Alternatively, set its proxy auto-config URL to
+`http://127.0.0.1:18080/proxy.pac` (substitute the chosen `--port`). The PAC
+routes `10.10.0.*` hosts through the proxy and other hosts directly. To
+verify the proxy, request an existing HTTP service at a numeric IPv4 address
+on the WireGuard network:
 
 ```sh
 curl --verbose --proxy http://127.0.0.1:18080 --noproxy localhost 'http://<SERVICE_PEER_IPV4>:<SERVICE_PORT>/'

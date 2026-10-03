@@ -14,7 +14,7 @@ use eyre::Result;
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::client::conn::http1 as client_http1;
-use hyper::header::{HOST, HeaderValue, UPGRADE};
+use hyper::header::{CONTENT_TYPE, HOST, HeaderValue, UPGRADE};
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
@@ -27,13 +27,14 @@ type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
 /// Serve a localhost HTTP forward proxy until the listener fails.
 pub async fn serve(listener: TcpListener, tcp: TcpStack) -> Result<()> {
+    let port = listener.local_addr()?.port();
     loop {
         let (client, _) = listener.accept().await?;
         let tcp = tcp.clone();
         tokio::spawn(async move {
             let service = service_fn(move |request| {
                 let tcp = tcp.clone();
-                async move { Ok::<_, Infallible>(forward(request, tcp).await) }
+                async move { Ok::<_, Infallible>(forward(request, tcp, port).await) }
             });
             if let Err(error) = server_http1::Builder::new()
                 .serve_connection(TokioIo::new(client), service)
@@ -96,7 +97,34 @@ fn empty(status: StatusCode) -> Response<ProxyBody> {
     response
 }
 
-async fn forward(mut request: Request<Incoming>, tcp: TcpStack) -> Response<ProxyBody> {
+async fn forward(mut request: Request<Incoming>, tcp: TcpStack, port: u16) -> Response<ProxyBody> {
+    if request.method() == Method::GET
+        && request.uri().authority().is_none()
+        && request.uri().path() == "/proxy.pac"
+    {
+        let script = format!(
+            concat!(
+                "function FindProxyForURL(url, host) {{\n",
+                "  if (shExpMatch(host, \"10.10.0.*\")) {{\n",
+                "    return \"PROXY 127.0.0.1:{}\";\n",
+                "  }}\n",
+                "  return \"DIRECT\";\n",
+                "}}\n",
+            ),
+            port
+        );
+        let mut response = Response::new(
+            Full::new(Bytes::from(script))
+                .map_err(|never| match never {})
+                .boxed(),
+        );
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/x-ns-proxy-autoconfig"),
+        );
+        return response;
+    }
+
     let destination = match destination(&request) {
         Ok(destination) => destination,
         Err(reason) => return message(StatusCode::BAD_REQUEST, reason),

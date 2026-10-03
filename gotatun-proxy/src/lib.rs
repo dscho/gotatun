@@ -693,11 +693,44 @@ mod tests {
         let proxy_address = proxy_listener.local_addr()?;
         let _proxy = tokio::spawn(http::serve(proxy_listener, client.tcp()));
 
+        let mut pac = tokio::net::TcpStream::connect(proxy_address).await?;
+        pac.write_all(b"GET /proxy.pac HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), pac.read_to_end(&mut response)).await??;
+        let response = String::from_utf8(response)?;
+        let (headers, body) = response
+            .split_once("\r\n\r\n")
+            .ok_or_else(|| eyre!("PAC response has no headers"))?;
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers}");
+        let headers = headers.to_ascii_lowercase();
+        assert!(
+            headers.contains("\r\ncontent-type: application/x-ns-proxy-autoconfig"),
+            "{headers}"
+        );
+        assert_eq!(
+            body,
+            format!(
+                concat!(
+                    "function FindProxyForURL(url, host) {{\n",
+                    "  if (shExpMatch(host, \"10.10.0.*\")) {{\n",
+                    "    return \"PROXY 127.0.0.1:{}\";\n",
+                    "  }}\n",
+                    "  return \"DIRECT\";\n",
+                    "}}\n",
+                ),
+                proxy_address.port()
+            )
+        );
+
         tokio::time::timeout(Duration::from_secs(5), async {
             tokio::try_join!(
                 async {
                     let headers = server_read_headers(&server_stack, plain).await?;
-                    assert!(headers.starts_with("GET /path HTTP/1.1\r\n"), "{headers}");
+                    assert!(
+                        headers.starts_with("GET /proxy.pac HTTP/1.1\r\n"),
+                        "{headers}"
+                    );
                     let headers = headers.to_ascii_lowercase();
                     assert!(!headers.contains("proxy-authorization:"), "{headers}");
                     assert!(!headers.contains("proxy-connection:"), "{headers}");
@@ -712,7 +745,7 @@ mod tests {
                     let mut socket = tokio::net::TcpStream::connect(proxy_address).await?;
                     socket
                         .write_all(
-                            b"GET http://10.10.0.1:8090/path HTTP/1.1\r\n\
+                            b"GET http://10.10.0.1:8090/proxy.pac HTTP/1.1\r\n\
                               Host: 10.10.0.1:8090\r\nProxy-Authorization: Basic dGVzdA==\r\n\
                               Proxy-Connection: keep-alive\r\nConnection: close\r\n\r\n",
                         )
