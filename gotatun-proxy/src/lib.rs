@@ -9,7 +9,7 @@
 /// HTTP forwarding and WebSocket tunneling over the userspace TCP stack.
 pub mod http;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::poll_fn;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -27,9 +27,11 @@ use gotatun::x25519;
 use parking_lot::Mutex;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device as PhyDevice, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{Socket, tcp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
+use smoltcp::wire::{
+    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Packet, TcpPacket,
+};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
@@ -189,8 +191,9 @@ struct Core {
     sockets: SocketSet<'static>,
     packets: PacketDevice,
     ports: HashSet<u16>,
+    listeners: HashMap<u16, SocketHandle>,
     next_port: u16,
-    closing: Vec<(SocketHandle, u16)>,
+    closing: Vec<(SocketHandle, Option<u16>)>,
 }
 
 impl Core {
@@ -210,9 +213,52 @@ impl Core {
             sockets: SocketSet::new(vec![]),
             packets,
             ports: HashSet::new(),
+            listeners: HashMap::new(),
             next_port: FIRST_LOCAL_PORT + rand::random::<u16>() % 16384,
             closing: Vec::new(),
         }
+    }
+
+    fn listen_for_incoming(&mut self, frame: &[u8]) {
+        // smoltcp needs a concrete listener before it polls an incoming SYN.
+        let Ok(ip) = Ipv4Packet::new_checked(frame) else {
+            return;
+        };
+        if ip.version() != 4
+            || ip.next_header() != IpProtocol::Tcp
+            || ip.frag_offset() != 0
+            || !self.iface.has_ip_addr(ip.dst_addr())
+        {
+            return;
+        }
+        let Ok(segment) = TcpPacket::new_checked(ip.payload()) else {
+            return;
+        };
+        let port = segment.dst_port();
+        let local = IpEndpoint::new(ip.dst_addr().into(), port);
+        let remote = IpEndpoint::new(ip.src_addr().into(), segment.src_port());
+        if port == 0
+            || !segment.syn()
+            || segment.ack()
+            || self.listeners.contains_key(&port)
+            || self.sockets.iter().any(|(_, socket)| {
+                matches!(socket, Socket::Tcp(socket)
+                    if (socket.is_listening() && socket.listen_endpoint().port == port)
+                        || (socket.local_endpoint() == Some(local)
+                            && socket.remote_endpoint() == Some(remote)))
+            })
+        {
+            return;
+        }
+        let handle = self.sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
+            tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
+        ));
+        self.sockets
+            .get_mut::<tcp::Socket>(handle)
+            .listen(port)
+            .expect("new socket with nonzero port can listen");
+        self.listeners.insert(port, handle);
     }
 
     fn allocate_port(&mut self) -> io::Result<u16> {
@@ -238,7 +284,9 @@ impl Core {
         for (handle, port) in std::mem::take(&mut self.closing) {
             if self.sockets.get::<tcp::Socket>(handle).state() == tcp::State::Closed {
                 self.sockets.remove(handle);
-                self.ports.remove(&port);
+                if let Some(port) = port {
+                    self.ports.remove(&port);
+                }
             } else {
                 still_closing.push((handle, port));
             }
@@ -296,7 +344,7 @@ impl TcpStack {
             core: Arc::clone(&self.core),
             wake: Arc::clone(&self.wake),
             handle,
-            port,
+            port: Some(port),
         };
         self.wake.notify_one();
         poll_fn(|cx| {
@@ -327,7 +375,7 @@ async fn run_stack(
 ) -> Result<()> {
     let started = StdInstant::now();
     loop {
-        let (frames, delay) = {
+        let (frames, delay, accepted) = {
             let mut core = core.lock();
             let millis = i64::try_from(started.elapsed().as_millis())
                 .map_err(|_| eyre!("TCP clock overflow"))?;
@@ -344,8 +392,99 @@ async fn run_stack(
                 .map(|duration| Duration::from_micros(duration.total_micros()))
                 .unwrap_or(Duration::from_secs(60));
             core.remove_closed();
-            (std::mem::take(&mut core.packets.outbound), delay)
+            let mut accepted = Vec::new();
+            let Core {
+                sockets,
+                packets,
+                listeners,
+                ..
+            } = &mut *core;
+            listeners.retain(|port, handle| {
+                if sockets.get::<tcp::Socket>(*handle).is_listening() {
+                    if packets.inbound.is_empty() {
+                        sockets.remove(*handle);
+                        false
+                    } else {
+                        true
+                    }
+                } else if sockets.get::<tcp::Socket>(*handle).is_active() {
+                    accepted.push((*handle, *port));
+                    false
+                } else {
+                    sockets.remove(*handle);
+                    false
+                }
+            });
+            (std::mem::take(&mut packets.outbound), delay, accepted)
         };
+        for (handle, port) in accepted {
+            let mut virtual_stream = TcpStream {
+                core: Arc::clone(&core),
+                wake: Arc::clone(&wake),
+                handle,
+                port: None,
+            };
+            tokio::spawn(async move {
+                let established = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    poll_fn(|cx| {
+                        let mut core = virtual_stream.core.lock();
+                        let socket = core.sockets.get_mut::<tcp::Socket>(handle);
+                        if socket.may_send() {
+                            Poll::Ready(true)
+                        } else if socket.is_active() {
+                            socket.register_send_waker(cx.waker());
+                            Poll::Pending
+                        } else {
+                            Poll::Ready(false)
+                        }
+                    }),
+                )
+                .await;
+                match established {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!("Incoming WireGuard TCP connection to port {port} closed");
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "Incoming WireGuard TCP connection to port {port} timed out: {error}"
+                        );
+                        virtual_stream
+                            .core
+                            .lock()
+                            .sockets
+                            .get_mut::<tcp::Socket>(handle)
+                            .abort();
+                        virtual_stream.wake.notify_one();
+                        return;
+                    }
+                }
+                let mut local =
+                    match tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await {
+                        Ok(local) => local,
+                        Err(error) => {
+                            tracing::warn!(
+                                "Cannot forward incoming WireGuard TCP to 127.0.0.1:{port}: {error}"
+                            );
+                            virtual_stream
+                                .core
+                                .lock()
+                                .sockets
+                                .get_mut::<tcp::Socket>(handle)
+                                .abort();
+                            virtual_stream.wake.notify_one();
+                            return;
+                        }
+                    };
+                if let Err(error) =
+                    tokio::io::copy_bidirectional(&mut virtual_stream, &mut local).await
+                {
+                    tracing::warn!("Reverse TCP connection to 127.0.0.1:{port} failed: {error}");
+                }
+            });
+        }
         let sent = !frames.is_empty();
         for frame in frames {
             let packet = Packet::copy_from(frame.as_slice()).try_into_ip()?;
@@ -360,7 +499,9 @@ async fn run_stack(
         tokio::select! {
             packet = incoming.recv() => {
                 let packet = packet.ok_or_else(|| eyre!("WireGuard device stopped sending IP packets"))?;
-                core.lock().packets.inbound.push_back(packet);
+                let mut core = core.lock();
+                core.listen_for_incoming(&packet);
+                core.packets.inbound.push_back(packet);
             }
             _ = wake.notified() => {}
             _ = tokio::time::sleep(delay) => {}
@@ -373,7 +514,7 @@ pub struct TcpStream {
     core: Arc<Mutex<Core>>,
     wake: Arc<Notify>,
     handle: SocketHandle,
-    port: u16,
+    port: Option<u16>,
 }
 
 impl AsyncRead for TcpStream {
@@ -675,6 +816,40 @@ mod tests {
                 echo(&server_stack, concurrent_a, b"red"),
                 echo(&server_stack, concurrent_b, b"blue"),
             )
+        })
+        .await??;
+        server.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inbound_wireguard_tcp_reaches_localhost() -> Result<()> {
+        let (server_stack, _client, server) = peers().await?;
+        let localhost = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let destination =
+            SocketAddrV4::new(Ipv4Addr::new(10, 10, 0, 5), localhost.local_addr()?.port());
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut first = server_stack.connect(destination).await?;
+            let mut second = server_stack.connect(destination).await?;
+            first.write_all(b"one!").await?;
+            first.shutdown().await?;
+            second.write_all(b"two!").await?;
+            second.shutdown().await?;
+
+            for _ in 0..2 {
+                let (mut local, _) = localhost.accept().await?;
+                let mut data = Vec::new();
+                local.read_to_end(&mut data).await?;
+                local.write_all(&data).await?;
+            }
+            let mut echoed = Vec::new();
+            first.read_to_end(&mut echoed).await?;
+            assert_eq!(echoed, b"one!");
+            echoed.clear();
+            second.read_to_end(&mut echoed).await?;
+            assert_eq!(echoed, b"two!");
+            Ok::<_, eyre::Report>(())
         })
         .await??;
         server.stop().await;

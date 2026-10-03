@@ -81,12 +81,15 @@ The TUN-based Windows CLI requires `--wintun` (or `WINTUN_PATH`) to specify
 an absolute path to a trusted `wintun.dll` in a directory protected from
 unprivileged writes. It does not search for the DLL by name.
 
-## Userspace HTTP proxy
+## Userspace HTTP and reverse TCP proxy
 
 `gotatun-proxy` joins an existing WireGuard network as a new peer and exposes
 a localhost HTTP proxy, without a TUN device, Wintun, or system-wide routing.
-Applications must explicitly use the proxy. The existing reachable peer can
-also forward traffic to other peers if its network is configured to do so.
+Applications must explicitly use the HTTP proxy for outbound traffic. The
+existing reachable peer can also forward traffic to other peers if its
+network is configured to do so.
+Incoming TCP connections to the joining peer are forwarded to its
+`127.0.0.1` on the same port.
 This implementation currently supports only the `10.10.0.0/24` network and
 numeric IPv4 proxy destinations.
 

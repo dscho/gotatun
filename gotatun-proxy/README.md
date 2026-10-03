@@ -1,9 +1,13 @@
-# Userspace HTTP proxy
+# Userspace HTTP and reverse TCP proxy
 
 `gotatun-proxy` participates in an existing WireGuard network as a **joining
 peer**. It exposes a localhost HTTP proxy instead of a TUN interface:
 applications opt in to the proxy, and other traffic keeps its normal routing.
 It forwards HTTP and `ws://` upgrades and uses CONNECT for HTTPS and `wss://`.
+Incoming TCP connections to the joining peer's WireGuard address are forwarded
+to `127.0.0.1` on the same port: for example, `10.10.0.5:7421` reaches
+`127.0.0.1:7421`. Any TCP service reachable on `127.0.0.1` can therefore be
+reached by WireGuard peers able to connect to the joining peer.
 
 The **reachable peer** already has a WireGuard interface and a UDP endpoint
 accessible to the joining peer. If it forwards traffic to other peers, it
