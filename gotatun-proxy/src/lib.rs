@@ -39,7 +39,7 @@ use tokio::task::JoinHandle;
 const MTU: usize = 1420;
 const PACKET_QUEUE: usize = 128;
 const TCP_BUFFER: usize = 16 * 1024;
-const OUTBOUND_TCP_RECV_BUFFER: usize = 1024 * 1024;
+const TCP_RECV_BUFFER: usize = 1024 * 1024;
 const FIRST_LOCAL_PORT: u16 = 49152;
 
 type WgDevice = Device<(UdpSocketFactory, ToStack, FromStack)>;
@@ -252,7 +252,7 @@ impl Core {
             return;
         }
         let handle = self.sockets.add(tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
+            tcp::SocketBuffer::new(vec![0; TCP_RECV_BUFFER]),
             tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
         ));
         self.sockets
@@ -326,7 +326,7 @@ impl TcpStack {
             let mut core = self.core.lock();
             let port = core.allocate_port()?;
             let handle = core.sockets.add(tcp::Socket::new(
-                tcp::SocketBuffer::new(vec![0; OUTBOUND_TCP_RECV_BUFFER]),
+                tcp::SocketBuffer::new(vec![0; TCP_RECV_BUFFER]),
                 tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
             ));
             let Core { iface, sockets, .. } = &mut *core;
@@ -617,7 +617,7 @@ mod tests {
     fn listen(stack: &TcpStack, port: u16) -> Result<SocketHandle> {
         let mut core = stack.core.lock();
         let handle = core.sockets.add(tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
+            tcp::SocketBuffer::new(vec![0; TCP_RECV_BUFFER]),
             tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
         ));
         core.sockets.get_mut::<tcp::Socket>(handle).listen(port)?;
@@ -899,13 +899,27 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_wireguard_tcp_reaches_localhost() -> Result<()> {
-        let (server_stack, _client, server) = peers().await?;
+        let (server_stack, client, server) = peers().await?;
         let localhost = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let destination =
             SocketAddrV4::new(Ipv4Addr::new(10, 10, 0, 5), localhost.local_addr()?.port());
 
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut first = server_stack.connect(destination).await?;
+            let buffer_sizes = {
+                let core = client.stack.core.lock();
+                core.sockets.iter().find_map(|(_, socket)| match socket {
+                    Socket::Tcp(socket)
+                        if socket
+                            .local_endpoint()
+                            .is_some_and(|endpoint| endpoint.port == destination.port()) =>
+                    {
+                        Some((socket.recv_capacity(), socket.send_capacity()))
+                    }
+                    _ => None,
+                })
+            };
+            assert_eq!(buffer_sizes, Some((TCP_RECV_BUFFER, TCP_BUFFER)));
             let mut second = server_stack.connect(destination).await?;
             first.write_all(b"one!").await?;
             first.shutdown().await?;
