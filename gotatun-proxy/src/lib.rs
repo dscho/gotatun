@@ -39,6 +39,7 @@ use tokio::task::JoinHandle;
 const MTU: usize = 1420;
 const PACKET_QUEUE: usize = 128;
 const TCP_BUFFER: usize = 16 * 1024;
+const OUTBOUND_TCP_RECV_BUFFER: usize = 1024 * 1024;
 const FIRST_LOCAL_PORT: u16 = 49152;
 
 type WgDevice = Device<(UdpSocketFactory, ToStack, FromStack)>;
@@ -325,7 +326,7 @@ impl TcpStack {
             let mut core = self.core.lock();
             let port = core.allocate_port()?;
             let handle = core.sockets.add(tcp::Socket::new(
-                tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
+                tcp::SocketBuffer::new(vec![0; OUTBOUND_TCP_RECV_BUFFER]),
                 tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
             ));
             let Core { iface, sockets, .. } = &mut *core;
@@ -779,6 +780,80 @@ mod tests {
         )
         .await?;
         Ok((server_stack, client, server))
+    }
+
+    #[tokio::test]
+    async fn download_over_delayed_tcp_link() -> Result<()> {
+        let hub_address = Ipv4Addr::new(10, 10, 0, 1);
+        let (client, client_in, client_out, _client_task) =
+            TcpStack::new(Ipv4Addr::new(10, 10, 0, 5));
+        let (server, server_in, server_out, _server_task) = TcpStack::new(hub_address);
+        let relay = |mut source: FromStack, destination: ToStack| {
+            tokio::spawn(async move {
+                let mut pending = VecDeque::new();
+                loop {
+                    let deadline = pending.front().map(|(deadline, _)| *deadline);
+                    tokio::select! {
+                        packet = source.0.recv() => {
+                            let Some(packet) = packet else {
+                                return Ok::<_, eyre::Report>(());
+                            };
+                            pending.push_back((
+                                tokio::time::Instant::now() + Duration::from_millis(75),
+                                packet,
+                            ));
+                        }
+                        _ = tokio::time::sleep_until(
+                            deadline.unwrap_or_else(tokio::time::Instant::now)
+                        ), if deadline.is_some() => {
+                            let (_, packet) = pending.pop_front().expect("packet is due");
+                            destination
+                                .0
+                                .send(packet.into_bytes().as_ref().to_vec())
+                                .await?;
+                        }
+                    }
+                }
+            })
+        };
+        let _outbound = relay(client_out, server_in);
+        let _inbound = relay(server_out, client_in);
+
+        let handle = {
+            let mut core = server.core.lock();
+            let handle = core.sockets.add(tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
+                tcp::SocketBuffer::new(vec![0; 1024 * 1024]),
+            ));
+            core.sockets.get_mut::<tcp::Socket>(handle).listen(8080)?;
+            handle
+        };
+        server.wake.notify_one();
+        let mut stream = client.connect(SocketAddrV4::new(hub_address, 8080)).await?;
+        stream.write_all(b"start").await?;
+        assert_eq!(server_read(&server, handle).await?, b"start");
+
+        let data = vec![42; 1024 * 1024];
+        let start = StdInstant::now();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::try_join!(server_write(&server, handle, &data), async {
+                let mut received = vec![0; data.len()];
+                stream.read_exact(&mut received).await?;
+                assert_eq!(received, data);
+                Ok::<_, eyre::Report>(())
+            })
+        })
+        .await??;
+        let elapsed = start.elapsed();
+        eprintln!(
+            "1 MiB download over ~150 ms RTT: {:.0} KiB/s",
+            data.len() as f64 / elapsed.as_secs_f64() / 1024.0
+        );
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "1 MiB download over ~150 ms RTT took {elapsed:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
